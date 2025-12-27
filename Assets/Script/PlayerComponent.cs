@@ -8,12 +8,11 @@ public class PlayerComponent : NetworkBehaviour
     [SerializeField] private float speed = 5f;
 
     [Header("References")]
-    [SerializeField] private Transform holdBallPos; // 拖到 Inspector
+    [SerializeField] public Transform holdBallPos; // 拖到 Inspector
     public TextMeshProUGUI infoPanel;
 
     [Header("Gameplay State")]
     public bool isThrower = false;
-    private bool hasBall = false;
 
     private GameObject ball;
 
@@ -49,39 +48,40 @@ public class PlayerComponent : NetworkBehaviour
 
     private void Update()
     {
-        UpdateInfoClientRpc();
         if (!IsOwner) return;
 
-        //UpdateInfoClientRpc();
+        UpdateInfoClientRpc();
         HandleMovement();
         FaceMouse();
 
-        if (hasBall && Input.GetMouseButtonDown(0)) // 左键投掷
+        var ballComponent = ball.GetComponent<BallComponent>();
+        if (ballComponent.holderId.Value != ulong.MaxValue && ballComponent.holderId.Value == NetworkManager.Singleton.LocalClientId)
         {
-            RequestThrowBallServerRpc();
+            if (Input.GetMouseButtonDown(0)) // 左键投掷
+            {
+                RequestThrowBallServerRpc();
+            }
         }
     }
 
-
     private void OnCollisionEnter2D(Collision2D collision)
     {
-        if (!IsOwner || !isThrower || hasBall) return;
+        if (!IsOwner || !isThrower) return;
 
         if (collision.gameObject.CompareTag("Ball"))
         {
             Debug.Log("Ball collided!");
 
-            var ball = collision.gameObject.GetComponent<BallComponent>();
-            Debug.Log("Ball holderId: " + ball.holderId.Value);
-            if (ball != null && ball.holderId.Value == ulong.MaxValue)
+            var ballComponent = collision.gameObject.GetComponent<BallComponent>();
+            Debug.Log("Ball holderId: " + ballComponent.holderId.Value);
+			if(ballComponent == null) Debug.
+            if (ballComponent != null && ballComponent.holderId.Value != ulong.MaxValue)
             {
                 Debug.Log("Trying to pick up ball...");
-                TryPickupBallServerRpc(ball.NetworkObject);
+                TryPickupBallServerRpc(ballComponent.NetworkObject);
             }
         }
     }
-
-
 
     // ===== Movement & Facing =====
 
@@ -111,36 +111,38 @@ public class PlayerComponent : NetworkBehaviour
 
     // ===== Server RPCs =====
 
-    [ServerRpc]
+    [ServerRpc(RequireOwnership = false)]
     private void TryPickupBallServerRpc(NetworkObjectReference ballRef)
     {
-        if (!isThrower || hasBall) return;
+        Debug.Log($"[Server] Player {OwnerClientId} tried to pick up ball");
+
+        if (!isThrower) return;
 
         if (ballRef.TryGet(out NetworkObject ballObj))
         {
             var ball = ballObj.GetComponent<BallComponent>();
-            if (ball != null && ball.holderId.Value != ulong.MaxValue && ball.holderId.Value != OwnerClientId)// this is a double check that's actually repetitive, i just realized
+            if (ball != null && ball.holderId.Value != ulong.MaxValue)
             {
-                hasBall = true;
-                ball.SetHeldBy(OwnerClientId, holdBallPos);
-                UpdateInfoClientRpc();
+                ball.PickUp(OwnerClientId);
+
+                Debug.Log($"[Server] Player {OwnerClientId} picked up ball");
             }
         }
     }
 
-    [ServerRpc]
-    private void RequestThrowBallServerRpc()
+    [ServerRpc(RequireOwnership = false)]
+    private void RequestThrowBallServerRpc(ServerRpcParams rpcParams = default)
     {
-        //if (!hasBall || heldBall == null) return;
+        ulong requestingClientId = rpcParams.Receive.SenderClientId;
+        GameObject ballObj = GameObject.FindWithTag("Ball"); // 确保球的 tag 设置为 "Ball"
+        if (ballObj == null) return;
+        var ballComponent = ballObj.GetComponent<BallComponent>();
+
+        if (ballComponent.holderId.Value == ulong.MaxValue || ballComponent.holderId.Value != requestingClientId)
+            return;
 
         Vector2 throwDir = transform.right.normalized;
-        Vector2 throwForce = throwDir * 10f;
-
-        ball.GetComponent<BallComponent>().DropAndThrow(throwForce);
-
-        hasBall = false;
-
-        UpdateInfoClientRpc();
+        ballComponent.DropAndThrow(throwDir * 10f);
     }
 
     // ===== Client RPCs =====
@@ -148,12 +150,15 @@ public class PlayerComponent : NetworkBehaviour
     [ClientRpc]
     private void UpdateInfoClientRpc()
     {
-        //if (!IsOwner) return;
-
         if (infoPanel == null) return;
+
+        var ballComponent = ball.GetComponent<BallComponent>();
+
+        bool hasBall = ballComponent.holderId.Value != ulong.MaxValue && ballComponent.holderId.Value == NetworkManager.Singleton.LocalClientId;
+
         infoPanel.text = (isThrower ? "Thrower" : "Dodger") +
                          (hasBall ? " (Has Ball)" : "") +
-                         (ball.GetComponent<BallComponent>().holderId.Value);
+                         (ballComponent.holderId.Value);
     }
 
     /*

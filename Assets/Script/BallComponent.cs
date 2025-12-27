@@ -7,52 +7,66 @@ public class BallComponent : NetworkBehaviour
     public float friction = 3f;
     public float bounceDamping = 0.6f;
 
-    //public NetworkVariable<bool> isHeld = new NetworkVariable<bool>(
-    //    false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-
+    /*public NetworkVariable<bool> isHeld = new NetworkVariable<bool>(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server
+    );
+*/
+    
     public NetworkVariable<ulong> holderId = new NetworkVariable<ulong>(
-        0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
-    public NetworkVariable<NetworkObjectReference> holderObject = new NetworkVariable<NetworkObjectReference>();
+        writePerm: NetworkVariableWritePermission.Server);
 
-    private Transform followTarget = null;
+
     private Rigidbody2D rb;
 
     private void Awake()
     {
         rb = GetComponent<Rigidbody2D>();
-        holderId.Value = ulong.MaxValue;
     }
 
     private void Update()
     {
         if (IsServer)
         {
-            if (holderId.Value != ulong.MaxValue && holderObject.Value.TryGet(out var holderNetObj))
+            if (holderId.Value != ulong.MaxValue && NetworkManager.Singleton.ConnectedClients.ContainsKey(holderId.Value))
             {
-                transform.position = holderNetObj.transform.position;
-                rb.velocity = Vector2.zero;
-                rb.angularVelocity = 0;
+                var playerObj = NetworkManager.Singleton.ConnectedClients[holderId.Value].PlayerObject;
+                if (playerObj != null)
+                {
+                    // ✅ 跟随持有者的位置
+                    transform.position = playerObj.GetComponent<PlayerComponent>().holdBallPos.position;
+                    rb.linearVelocity = Vector2.zero;
+                    rb.angularVelocity = 0;
+                }
             }
             else
             {
+                // 模拟摩擦：每帧减速
                 rb.linearVelocity = Vector2.Lerp(rb.linearVelocity, Vector2.zero, friction * Time.deltaTime);
             }
         }
     }
 
-
-    public void SetHeldBy(ulong newHolderId, Transform holderTransform)
+    public void PickUp(ulong clientId)
     {
-        holderId.Value = newHolderId;
-        holderObject.Value = holderTransform.GetComponent<NetworkObject>();
-    }
+        holderId.Value = clientId;
+        //isHeld.Value = true;
 
+        rb.linearVelocity = Vector2.zero;
+        rb.angularVelocity = 0;
+        rb.bodyType = RigidbodyType2D.Kinematic;
+
+        Debug.Log($"[Server] Ball now held by client {clientId}");
+    }
 
     public void DropAndThrow(Vector2 velocity)
     {
         holderId.Value = ulong.MaxValue;
-        followTarget = null;
-        rb.linearVelocity = velocity;
+        //isHeld.Value = false;
+
+        rb.bodyType = RigidbodyType2D.Dynamic;
+        rb.AddForce(velocity, ForceMode2D.Impulse);
     }
 
     private void OnCollisionEnter2D(Collision2D collision)
