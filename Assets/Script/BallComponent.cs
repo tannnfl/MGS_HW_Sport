@@ -4,7 +4,7 @@ using UnityEngine;
 public class BallComponent : NetworkBehaviour
 {
     [Header("Physics Settings")]
-    public float friction = 3f;
+    public float friction = 1f;
     public float bounceDamping = 0.6f;
 
     /*public NetworkVariable<bool> isHeld = new NetworkVariable<bool>(

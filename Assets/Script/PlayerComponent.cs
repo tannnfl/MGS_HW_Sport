@@ -12,7 +12,7 @@ public class PlayerComponent : NetworkBehaviour
     public TextMeshProUGUI infoPanel;
 
     [Header("Gameplay State")]
-    public bool isThrower = false;
+    public NetworkVariable<bool> isThrower;
 
     private GameObject ball;
 
@@ -20,18 +20,17 @@ public class PlayerComponent : NetworkBehaviour
 
     public override void OnNetworkSpawn()
     {
+        infoPanel = GameObject.Find("PlayerInfoPanel").GetComponent<TextMeshProUGUI>();
         if (IsServer)
         {
             // Server 设置角色身份和出生点
-            print(OwnerClientId);
-            isThrower = OwnerClientId < 2;
-            Transform spawnPos = GameManager.Instance.GetSpawnPosition(isThrower);
-            transform.position = spawnPos.position;
-            transform.rotation = spawnPos.rotation;
+            
+            
         }
 
         if (IsOwner)
         {
+            print("Player" + OwnerClientId + " Spawned");
             GameManager.Instance.RegisterPlayer(this);
             //UpdateInfoPanel();
             var camFollow = Camera.main.GetComponent<CameraFollow>();
@@ -41,6 +40,11 @@ public class PlayerComponent : NetworkBehaviour
             {
                 camFollow.SetTargets(transform, ball.transform);
             }
+            isThrower.Value = OwnerClientId < 2;
+            Transform spawnPos = GameManager.Instance.GetSpawnPosition(isThrower.Value);
+            transform.position = spawnPos.position;
+            transform.rotation = spawnPos.rotation;
+            //if (!isThrower) GetComponent<SpriteRenderer>().color = new Color(0.2f, 0.5f, 0.35f, 0);
         }
     }
 
@@ -66,7 +70,7 @@ public class PlayerComponent : NetworkBehaviour
 
     private void OnCollisionEnter2D(Collision2D collision)
     {
-        if (!IsOwner || !isThrower) return;
+        if (!IsOwner || !isThrower.Value) return;
 
         if (collision.gameObject.CompareTag("Ball"))
         {
@@ -74,8 +78,10 @@ public class PlayerComponent : NetworkBehaviour
 
             var ballComponent = collision.gameObject.GetComponent<BallComponent>();
             Debug.Log("Ball holderId: " + ballComponent.holderId.Value);
-			if(ballComponent == null) Debug.
-            if (ballComponent != null && ballComponent.holderId.Value != ulong.MaxValue)
+			if(ballComponent == null) Debug.Log("BallComponent is null");
+            if (ballComponent.holderId.Value != ulong.MaxValue)
+                Debug.Log("Ball is holded by" + ballComponent.holderId.Value);
+            if (ballComponent != null && ballComponent.holderId.Value == ulong.MaxValue)
             {
                 Debug.Log("Trying to pick up ball...");
                 TryPickupBallServerRpc(ballComponent.NetworkObject);
@@ -116,13 +122,15 @@ public class PlayerComponent : NetworkBehaviour
     {
         Debug.Log($"[Server] Player {OwnerClientId} tried to pick up ball");
 
-        if (!isThrower) return;
+        //if (!isThrower) return;
 
         if (ballRef.TryGet(out NetworkObject ballObj))
         {
+            Debug.Log($"[Server] Player {OwnerClientId} picking condition 111 passed");
             var ball = ballObj.GetComponent<BallComponent>();
-            if (ball != null && ball.holderId.Value != ulong.MaxValue)
+            if (ball != null && ball.holderId.Value == ulong.MaxValue)
             {
+                Debug.Log($"[Server] Player {OwnerClientId} picking condition 222 passed");
                 ball.PickUp(OwnerClientId);
 
                 Debug.Log($"[Server] Player {OwnerClientId} picked up ball");
@@ -150,15 +158,14 @@ public class PlayerComponent : NetworkBehaviour
     [ClientRpc]
     private void UpdateInfoClientRpc()
     {
+        Debug.Log("UpdateInfoClient：" + infoPanel);
         if (infoPanel == null) return;
 
-        var ballComponent = ball.GetComponent<BallComponent>();
+        //var ballComponent = ball.GetComponent<BallComponent>();
 
-        bool hasBall = ballComponent.holderId.Value != ulong.MaxValue && ballComponent.holderId.Value == NetworkManager.Singleton.LocalClientId;
+        //bool hasBall = ballComponent.holderId.Value != ulong.MaxValue && ballComponent.holderId.Value == NetworkManager.Singleton.LocalClientId;
 
-        infoPanel.text = (isThrower ? "Thrower" : "Dodger") +
-                         (hasBall ? " (Has Ball)" : "") +
-                         (ballComponent.holderId.Value);
+        infoPanel.text = (isThrower.Value ? "Thrower" : "Dodger");
     }
 
     /*
