@@ -1,83 +1,176 @@
-using Unity.Netcode;
 using UnityEngine;
+using Unity.Netcode;
 
 public class BallComponent : NetworkBehaviour
 {
     [Header("Physics Settings")]
-    public float friction = 1f;
-    public float bounceDamping = 0.6f;
+    public float bounceDamping = 0.85f;
 
-    /*public NetworkVariable<bool> isHeld = new NetworkVariable<bool>(
-        false,
+    // Bug fix #1: default = ulong.MaxValue set in constructor, NOT in Awake
+    // Bug fix #10: removed unused followTarget field
+    public NetworkVariable<ulong> holderId = new NetworkVariable<ulong>(
+        ulong.MaxValue,
         NetworkVariableReadPermission.Everyone,
         NetworkVariableWritePermission.Server
     );
-*/
-    
-    public NetworkVariable<ulong> holderId = new NetworkVariable<ulong>(
-        writePerm: NetworkVariableWritePermission.Server);
 
-
+    // Stores the root NetworkObject of the player currently holding the ball
+    private NetworkObject holderNetObj;
     private Rigidbody2D rb;
+
+    // Cached at runtime for dodger-zone eviction
+    private Transform dodgerZone;
+    private Vector3 ballRescuePos = new Vector3(-5f, 0f, 0f); // outside DodgerRegion
+
+    private float timeInDodgerZone;
+    private const float DodgerZoneEvictionDelay = 2f;
 
     private void Awake()
     {
         rb = GetComponent<Rigidbody2D>();
+        // Do NOT set holderId.Value here — NetworkVariable with ServerWrite
+        // cannot be written on all clients. Default is set in the constructor above.
+    }
+
+    public override void OnNetworkSpawn()
+    {
+        base.OnNetworkSpawn();
+
+        Debug.Log($"[Ball] OnNetworkSpawn — IsServer={IsServer}, IsOwner={IsOwner}, rb.simulated={rb.simulated}");
+
+        if (!IsServer)
+        {
+            rb.simulated = false;
+            Debug.Log($"[Ball] Client instance: rb.simulated set to FALSE (server is authoritative)");
+            return;
+        }
+
+        var dodgerRegionGO = GameObject.Find("DodgerRegion");
+        if (dodgerRegionGO != null) dodgerZone = dodgerRegionGO.transform;
+
+        var spawnGO = GameObject.Find("BallSpawnPos");
+        if (spawnGO != null) ballRescuePos = spawnGO.transform.position;
     }
 
     private void Update()
     {
-        if (IsServer)
+        if (!IsServer) return;
+
+        // Position ball in front of holder each frame when held
+        if (holderId.Value != ulong.MaxValue && holderNetObj != null)
         {
-            if (holderId.Value != ulong.MaxValue && NetworkManager.Singleton.ConnectedClients.ContainsKey(holderId.Value))
+            rb.linearVelocity = Vector2.zero;
+            rb.angularVelocity = 0f;
+            transform.position = holderNetObj.transform.position
+                                 + holderNetObj.transform.right * 1.0f;
+            timeInDodgerZone = 0f; // reset timer while held
+            return;
+        }
+
+        // Dodger-zone rule: once the ball comes to a natural stop inside the zone,
+        // wait 2 s then move it to the spawn point. Never zero velocity by hand.
+        if (dodgerZone != null)
+        {
+            float dodgerRadius = dodgerZone.lossyScale.x * 0.5f;
+            float dist = Vector2.Distance(transform.position, dodgerZone.position);
+            bool insideZone = dist < dodgerRadius;
+            bool almostStopped = rb.linearVelocity.magnitude < 0.05f;
+
+            if (insideZone && almostStopped)
             {
-                var playerObj = NetworkManager.Singleton.ConnectedClients[holderId.Value].PlayerObject;
-                if (playerObj != null)
+                timeInDodgerZone += Time.deltaTime;
+                if (timeInDodgerZone >= DodgerZoneEvictionDelay)
                 {
-                    // ✅ 跟随持有者的位置
-                    transform.position = playerObj.GetComponent<PlayerComponent>().holdBallPos.position;
-                    rb.linearVelocity = Vector2.zero;
-                    rb.angularVelocity = 0;
+                    timeInDodgerZone = 0f;
+                    transform.position = ballRescuePos;
                 }
             }
             else
             {
-                // 模拟摩擦：每帧减速
-                rb.linearVelocity = Vector2.Lerp(rb.linearVelocity, Vector2.zero, friction * Time.deltaTime);
+                timeInDodgerZone = 0f; // still moving or outside zone — reset timer
             }
         }
     }
 
-    public void PickUp(ulong clientId)
+    /// <summary>
+    /// Server-only: attach this ball to the given player.
+    /// Bug fix #3: takes the player's root NetworkObject, not a child Transform.
+    /// </summary>
+    public void SetHeldBy(ulong clientId, NetworkObject playerNetObj)
     {
+        if (!IsServer) return;
+
         holderId.Value = clientId;
-        //isHeld.Value = true;
+        holderNetObj = playerNetObj;
 
         rb.linearVelocity = Vector2.zero;
-        rb.angularVelocity = 0;
+        rb.angularVelocity = 0f;
         rb.bodyType = RigidbodyType2D.Kinematic;
-
-        Debug.Log($"[Server] Ball now held by client {clientId}");
     }
 
+    /// <summary>
+    /// Server-only: release ball and apply throw velocity.
+    /// </summary>
     public void DropAndThrow(Vector2 velocity)
     {
+        if (!IsServer) return;
+
         holderId.Value = ulong.MaxValue;
-        //isHeld.Value = false;
+        holderNetObj = null;
 
         rb.bodyType = RigidbodyType2D.Dynamic;
-        rb.AddForce(velocity, ForceMode2D.Impulse);
+        rb.linearVelocity = velocity;
+    }
+
+    /// <summary>
+    /// Server-only: reset ball position for round start.
+    /// </summary>
+    public void ResetBall(Vector3 position)
+    {
+        if (!IsServer) return;
+
+        holderId.Value = ulong.MaxValue;
+        holderNetObj = null;
+
+        rb.bodyType = RigidbodyType2D.Dynamic;
+        rb.linearVelocity = Vector2.zero;
+        rb.angularVelocity = 0f;
+        transform.position = position;
+
+        ballRescuePos = position;
+        timeInDodgerZone = 0f;
     }
 
     private void OnCollisionEnter2D(Collision2D collision)
     {
-        if (!IsServer || holderId.Value == ulong.MaxValue) return;
+        if (!IsServer) return;
 
-        // 反弹逻辑（只在 server 上）
-        if (collision.collider.gameObject.layer == LayerMask.NameToLayer("OutsideWall"))
+        // Bug fix #5: only process collisions when ball is FREE (not held)
+        if (holderId.Value != ulong.MaxValue) return;
+
+        // Reflect off outside walls
+        int outsideWallLayer = LayerMask.NameToLayer("OutsideWall");
+        if (outsideWallLayer >= 0 && collision.gameObject.layer == outsideWallLayer)
         {
-            Vector2 reflect = Vector2.Reflect(rb.linearVelocity, collision.contacts[0].normal);
-            rb.linearVelocity = reflect * bounceDamping;
+            Vector2 reflected = Vector2.Reflect(rb.linearVelocity, collision.contacts[0].normal);
+            rb.linearVelocity = reflected * bounceDamping;
+            return;
+        }
+
+        // Check if we hit a Dodger with sufficient velocity.
+        // Use collision.relativeVelocity (velocity at moment of contact, BEFORE Unity
+        // resolves the impulse) rather than rb.linearVelocity (post-impulse, already
+        // reduced by the bounce) so slow-ish hits aren't missed.
+        PlayerComponent player = collision.gameObject.GetComponent<PlayerComponent>();
+        if (player == null)
+            player = collision.gameObject.GetComponentInParent<PlayerComponent>();
+
+        if (player != null && !player.isThrower.Value)
+        {
+            float impactSpeed = collision.relativeVelocity.magnitude;
+            Debug.Log($"[Hit] Ball hit client {player.OwnerClientId} isThrower={player.isThrower.Value} impactSpeed={impactSpeed:F2}");
+            if (impactSpeed >= 0.5f)
+                GameManager.Instance?.EliminatePlayer(player.OwnerClientId);
         }
     }
 }

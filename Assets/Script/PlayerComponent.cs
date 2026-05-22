@@ -1,5 +1,5 @@
-using Unity.Netcode;
 using UnityEngine;
+using Unity.Netcode;
 using TMPro;
 
 public class PlayerComponent : NetworkBehaviour
@@ -7,46 +7,126 @@ public class PlayerComponent : NetworkBehaviour
     [Header("Movement Settings")]
     [SerializeField] private float speed = 5f;
 
-    [Header("References")]
-    [SerializeField] public Transform holdBallPos; // 拖到 Inspector
-    public TextMeshProUGUI infoPanel;
+    // Found at runtime — prefabs cannot hold scene object references
+    private Transform throwerZone;
+    private Transform dodgerZone;
 
-    [Header("Gameplay State")]
-    public NetworkVariable<bool> isThrower;
+    [Header("UI")]
+    [SerializeField] private TextMeshPro localInfoText; // world-space TMP, no Canvas needed
 
-    private GameObject ball;
+    // Bug fix #7: isThrower and hasBall must be NetworkVariables, not plain bools
+    // Bug fix #8 (role assignment): roles are now assigned by GameManager randomly
+    public NetworkVariable<bool> isThrower = new NetworkVariable<bool>(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server
+    );
+
+    public NetworkVariable<bool> hasBall = new NetworkVariable<bool>(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server
+    );
+
+    // Bug fix #4: ball cached on ALL instances, not just owner
+    private BallComponent ball;
+    private SpriteRenderer spriteRenderer;
 
     // ===== Netcode Lifecycle =====
 
     public override void OnNetworkSpawn()
     {
-        infoPanel = GameObject.Find("PlayerInfoPanel").GetComponent<TextMeshProUGUI>();
+        // Cache ball on ALL instances (not just owner) — bug fix #4
+        var ballObj = GameObject.FindWithTag("Ball");
+        if (ballObj != null)
+            ball = ballObj.GetComponent<BallComponent>();
+
+        // Find zone boundaries in the scene (can't be stored on prefab)
+        var throwerRegionGO = GameObject.Find("ThrowerRegion");
+        var dodgerRegionGO  = GameObject.Find("DodgerRegion");
+        if (throwerRegionGO != null) throwerZone = throwerRegionGO.transform;
+        if (dodgerRegionGO  != null) dodgerZone  = dodgerRegionGO.transform;
+
+        // Cache sprite renderer (exists on every instance for color updates)
+        spriteRenderer = GetComponent<SpriteRenderer>();
+        if (spriteRenderer == null) spriteRenderer = GetComponentInChildren<SpriteRenderer>();
+
+        Debug.Log($"[PlayerSpawn] ClientId={OwnerClientId} IsOwner={IsOwner} IsServer={IsServer} isThrower={isThrower.Value}");
+
         if (IsServer)
         {
-            // Server 设置角色身份和出生点
-            
-            
+            GameManager.Instance?.RegisterPlayer(this);
         }
+
+        // All instances subscribe to isThrower so every client sees the right colour
+        isThrower.OnValueChanged += OnRoleChanged;
+        UpdatePlayerColor();
 
         if (IsOwner)
         {
-            print("Player" + OwnerClientId + " Spawned");
-            GameManager.Instance.RegisterPlayer(this);
-            //UpdateInfoPanel();
-            var camFollow = Camera.main.GetComponent<CameraFollow>();
-            ball = GameObject.FindWithTag("Ball"); // 假设你只存在一个 Ball
+            var camFollow = Camera.main?.GetComponent<CameraFollow>();
+            if (camFollow != null && ballObj != null)
+                camFollow.SetTargets(transform, ballObj.transform);
 
-            if (camFollow != null && ball != null)
-            {
-                camFollow.SetTargets(transform, ball.transform);
-            }
-            isThrower.Value = OwnerClientId < 2;
-            Transform spawnPos = GameManager.Instance.GetSpawnPosition(isThrower.Value);
-            transform.position = spawnPos.position;
-            transform.rotation = spawnPos.rotation;
-            //if (!isThrower) GetComponent<SpriteRenderer>().color = new Color(0.2f, 0.5f, 0.35f, 0);
+            hasBall.OnValueChanged += OnHasBallChanged;
+            UpdateLocalInfoText();
         }
     }
+
+    public override void OnNetworkDespawn()
+    {
+        if (IsServer)
+        {
+            GameManager.Instance?.UnregisterPlayer(OwnerClientId);
+        }
+
+        isThrower.OnValueChanged -= OnRoleChanged;
+
+        if (IsOwner)
+        {
+            hasBall.OnValueChanged -= OnHasBallChanged;
+        }
+    }
+
+    // ===== UI / Visual Callbacks =====
+
+    private void OnRoleChanged(bool previous, bool current)
+    {
+        UpdatePlayerColor();
+        if (IsOwner) UpdateLocalInfoText();
+    }
+
+    private void UpdatePlayerColor()
+    {
+        if (spriteRenderer == null) return;
+        spriteRenderer.color = isThrower.Value ? new Color(1f, 0.5f, 0f) : Color.blue;
+    }
+
+    private void OnHasBallChanged(bool previous, bool current)
+    {
+        if (!current)
+        {
+            pickupRequested = false;
+            pickupCooldown = PickupCooldownDuration; // prevent instant re-pickup after throw
+        }
+        UpdateLocalInfoText();
+    }
+
+    private void UpdateLocalInfoText()
+    {
+        if (localInfoText == null) return;
+        string role = isThrower.Value ? "Thrower" : "Dodger";
+        string ballStatus = hasBall.Value ? " (Has Ball)" : "";
+        localInfoText.text = role + ballStatus;
+    }
+
+    // Prevent spamming pickup RPCs while waiting for server confirmation
+    private bool pickupRequested;
+    // Brief cooldown after throwing so the ball can travel past pickup radius first
+    private float pickupCooldown;
+    private const float PickupCooldownDuration = 0.4f;
+
+    private const float PickupRadius = 0.8f;
 
     // ===== Unity Lifecycle =====
 
@@ -54,38 +134,50 @@ public class PlayerComponent : NetworkBehaviour
     {
         if (!IsOwner) return;
 
-        UpdateInfoClientRpc();
         HandleMovement();
         FaceMouse();
 
-        var ballComponent = ball.GetComponent<BallComponent>();
-        if (ballComponent.holderId.Value != ulong.MaxValue && ballComponent.holderId.Value == NetworkManager.Singleton.LocalClientId)
+        if (hasBall.Value && Input.GetMouseButtonDown(0) && IsInThrowerZone())
         {
-            if (Input.GetMouseButtonDown(0)) // 左键投掷
-            {
-                RequestThrowBallServerRpc();
-            }
+            RequestThrowBallServerRpc();
+        }
+
+        // Proximity-based pickup: ball physics is disabled on clients (rb.simulated = false)
+        // so OnCollisionEnter2D never fires for the ball. Check distance instead.
+        if (pickupCooldown > 0f) pickupCooldown -= Time.deltaTime;
+
+        if (isThrower.Value && !hasBall.Value && !pickupRequested && pickupCooldown <= 0f)
+        {
+            CheckBallProximity();
         }
     }
 
-    private void OnCollisionEnter2D(Collision2D collision)
+    private void CheckBallProximity()
     {
-        if (!IsOwner || !isThrower.Value) return;
-
-        if (collision.gameObject.CompareTag("Ball"))
+        if (ball == null)
         {
-            Debug.Log("Ball collided!");
+            var ballObj = GameObject.FindWithTag("Ball");
+            if (ballObj != null) ball = ballObj.GetComponent<BallComponent>();
+        }
+        if (ball == null)
+        {
+            Debug.LogWarning($"[Pickup] Client {NetworkManager.Singleton.LocalClientId}: ball not found in scene");
+            return;
+        }
+        if (ball.holderId.Value != ulong.MaxValue)
+        {
+            // Ball is held — don't log every frame, just skip silently
+            return;
+        }
 
-            var ballComponent = collision.gameObject.GetComponent<BallComponent>();
-            Debug.Log("Ball holderId: " + ballComponent.holderId.Value);
-			if(ballComponent == null) Debug.Log("BallComponent is null");
-            if (ballComponent.holderId.Value != ulong.MaxValue)
-                Debug.Log("Ball is holded by" + ballComponent.holderId.Value);
-            if (ballComponent != null && ballComponent.holderId.Value == ulong.MaxValue)
-            {
-                Debug.Log("Trying to pick up ball...");
-                TryPickupBallServerRpc(ballComponent.NetworkObject);
-            }
+        float dist = Vector2.Distance(transform.position, ball.transform.position);
+        Debug.Log($"[Pickup] Client {NetworkManager.Singleton.LocalClientId}: dist={dist:F2} (need <{PickupRadius}), holderId={ball.holderId.Value}");
+
+        if (dist < PickupRadius)
+        {
+            Debug.Log($"[Pickup] Client {NetworkManager.Singleton.LocalClientId}: close enough — sending TryPickupBallServerRpc");
+            pickupRequested = true;
+            TryPickupBallServerRpc(ball.NetworkObject);
         }
     }
 
@@ -95,93 +187,146 @@ public class PlayerComponent : NetworkBehaviour
     {
         float h = Input.GetAxis("Horizontal");
         float v = Input.GetAxis("Vertical");
-
-        Vector3 movement = new Vector3(h, v, 0) * speed * Time.deltaTime;
+        Vector3 movement = new Vector3(h, v, 0f) * speed * Time.deltaTime;
         transform.position += movement;
+        EnforceZoneBoundary();
+    }
+
+    private void EnforceZoneBoundary()
+    {
+        Vector2 pos = transform.position;
+
+        if (isThrower.Value)
+        {
+            // Throwers: free to roam anywhere, including the dodger zone.
+            // Only clamp to the outer arena wall.
+            if (throwerZone != null)
+            {
+                Vector2 center = throwerZone.position;
+                float radius   = throwerZone.lossyScale.x * 0.5f;
+                Vector2 offset = pos - center;
+                if (offset.magnitude > radius)
+                    pos = center + offset.normalized * radius;
+            }
+        }
+        else
+        {
+            // Dodgers: confined to the inner circle.
+            if (dodgerZone != null)
+            {
+                Vector2 center = dodgerZone.position;
+                float radius   = dodgerZone.lossyScale.x * 0.5f;
+                Vector2 offset = pos - center;
+                if (offset.magnitude > radius)
+                    pos = center + offset.normalized * radius;
+            }
+        }
+
+        transform.position = new Vector3(pos.x, pos.y, transform.position.z);
     }
 
     private void FaceMouse()
     {
-        Vector3 mouseScreenPos = Input.mousePosition;
-        Vector3 mouseWorldPos = Camera.main.ScreenToWorldPoint(mouseScreenPos);
-        mouseWorldPos.z = 0;
-
+        if (Camera.main == null) return;
+        Vector3 mouseWorldPos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
+        mouseWorldPos.z = 0f;
         Vector3 direction = mouseWorldPos - transform.position;
-
-        // ✅ 阈值限制，避免小抖动导致转向
         if (direction.magnitude < 0.1f) return;
-
         float angle = Mathf.Atan2(direction.y, direction.x) * Mathf.Rad2Deg;
-        transform.rotation = Quaternion.Euler(0, 0, angle);
+        transform.rotation = Quaternion.Euler(0f, 0f, angle);
+    }
+
+    // Returns true when the player is outside the dodger zone (i.e. in the thrower ring).
+    // If zone data is missing, allow throwing to avoid blocking the player entirely.
+    private bool IsInThrowerZone()
+    {
+        if (dodgerZone == null) return true;
+        float radius = dodgerZone.lossyScale.x * 0.5f;
+        return Vector2.Distance(transform.position, dodgerZone.position) >= radius;
+    }
+
+    // ===== Server Methods =====
+
+    /// <summary>
+    /// Called by GameManager on the server to assign a role and teleport the player.
+    /// NetworkVariables are set server-side; teleport is sent directly to the owning
+    /// client via ClientRpc because OwnerNetworkTransform is owner-authoritative
+    /// (server-side transform writes get overridden by the client).
+    /// </summary>
+    public void SetRoleAndSpawn(bool isThrowerRole, Vector3 pos, Quaternion rot)
+    {
+        if (!IsServer) return;
+        Debug.Log($"[RoleAssign] Assigning client {OwnerClientId} → isThrower={isThrowerRole}, pos={pos}");
+        isThrower.Value = isThrowerRole;
+        hasBall.Value = false;
+
+        // Target only the owning client so they teleport their own character
+        ClientRpcParams rpcParams = new ClientRpcParams
+        {
+            Send = new ClientRpcSendParams { TargetClientIds = new[] { OwnerClientId } }
+        };
+        TeleportOwnerClientRpc(pos, rot, rpcParams);
+    }
+
+    [ClientRpc]
+    private void TeleportOwnerClientRpc(Vector3 pos, Quaternion rot, ClientRpcParams rpcParams = default)
+    {
+        // Only the targeted owner runs this; they set their own transform
+        transform.position = pos;
+        transform.rotation = rot;
     }
 
     // ===== Server RPCs =====
 
-    [ServerRpc(RequireOwnership = false)]
+    [ServerRpc]
     private void TryPickupBallServerRpc(NetworkObjectReference ballRef)
     {
-        Debug.Log($"[Server] Player {OwnerClientId} tried to pick up ball");
+        Debug.Log($"[PickupRPC] Server received pickup request from client {OwnerClientId}: isThrower={isThrower.Value}, hasBall={hasBall.Value}");
 
-        //if (!isThrower) return;
+        if (!isThrower.Value)  { Debug.LogWarning($"[PickupRPC] Rejected: client {OwnerClientId} is not a thrower"); return; }
+        if (hasBall.Value)     { Debug.LogWarning($"[PickupRPC] Rejected: client {OwnerClientId} already has ball"); return; }
 
-        if (ballRef.TryGet(out NetworkObject ballObj))
+        BallComponent ballComp = ball;
+        if (ballComp == null)
         {
-            Debug.Log($"[Server] Player {OwnerClientId} picking condition 111 passed");
-            var ball = ballObj.GetComponent<BallComponent>();
-            if (ball != null && ball.holderId.Value == ulong.MaxValue)
-            {
-                Debug.Log($"[Server] Player {OwnerClientId} picking condition 222 passed");
-                ball.PickUp(OwnerClientId);
-
-                Debug.Log($"[Server] Player {OwnerClientId} picked up ball");
-            }
+            var ballObj = GameObject.FindWithTag("Ball");
+            if (ballObj != null) ballComp = ballObj.GetComponent<BallComponent>();
         }
+        if (ballRef.TryGet(out NetworkObject ballNetObj))
+        {
+            var refBall = ballNetObj.GetComponent<BallComponent>();
+            if (refBall != null) ballComp = refBall;
+        }
+
+        if (ballComp == null) { Debug.LogWarning($"[PickupRPC] Rejected: ball component not found"); return; }
+
+        Debug.Log($"[PickupRPC] Ball holderId={ballComp.holderId.Value} (MaxValue={ulong.MaxValue} means free)");
+        if (ballComp.holderId.Value != ulong.MaxValue) { Debug.LogWarning($"[PickupRPC] Rejected: ball is already held by {ballComp.holderId.Value}"); return; }
+
+        Debug.Log($"[PickupRPC] Pickup SUCCESS for client {OwnerClientId}");
+        hasBall.Value = true;
+        ballComp.SetHeldBy(OwnerClientId, NetworkObject);
     }
 
-    [ServerRpc(RequireOwnership = false)]
-    private void RequestThrowBallServerRpc(ServerRpcParams rpcParams = default)
+    [ServerRpc]
+    private void RequestThrowBallServerRpc()
     {
-        ulong requestingClientId = rpcParams.Receive.SenderClientId;
-        GameObject ballObj = GameObject.FindWithTag("Ball"); // 确保球的 tag 设置为 "Ball"
-        if (ballObj == null) return;
-        var ballComponent = ballObj.GetComponent<BallComponent>();
+        if (!hasBall.Value) return;
 
-        if (ballComponent.holderId.Value == ulong.MaxValue || ballComponent.holderId.Value != requestingClientId)
-            return;
+        // Bug fix #4: find ball with fallback — server may not have ball cached
+        BallComponent ballComp = ball;
+        if (ballComp == null)
+        {
+            var ballObj = GameObject.FindWithTag("Ball");
+            if (ballObj != null)
+                ballComp = ballObj.GetComponent<BallComponent>();
+        }
+
+        if (ballComp == null) return;
 
         Vector2 throwDir = transform.right.normalized;
-        ballComponent.DropAndThrow(throwDir * 10f);
+        ballComp.DropAndThrow(throwDir * 10f);
+
+        hasBall.Value = false;
     }
-
-    // ===== Client RPCs =====
-
-    [ClientRpc]
-    private void UpdateInfoClientRpc()
-    {
-        Debug.Log("UpdateInfoClient：" + infoPanel);
-        if (infoPanel == null) return;
-
-        //var ballComponent = ball.GetComponent<BallComponent>();
-
-        //bool hasBall = ballComponent.holderId.Value != ulong.MaxValue && ballComponent.holderId.Value == NetworkManager.Singleton.LocalClientId;
-
-        infoPanel.text = (isThrower.Value ? "Thrower" : "Dodger");
-    }
-
-    /*
-    public void LoseAndBecomeDodger()
-    {
-        if (!isThrower) return; // 已经是 thrower 就不重复转换
-
-        isThrower = false;
-
-        // 移动到 thrower 区域
-        Transform spawnPos = GameManager.Instance.GetSpawnPosition(true);
-        transform.position = spawnPos.position;
-        transform.rotation = spawnPos.rotation;
-
-        // 更新客户端 UI
-        UpdateInfoClientRpc();
-    }
-    */
 }
